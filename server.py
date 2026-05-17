@@ -1,85 +1,83 @@
 """
-WiFi Threat Monitor — Flask REST API
-Serves real-time data to the dashboard frontend.
+WiFi Threat Monitor — Flask Server
+Run: sudo python server.py
+Then open: http://localhost:5050
 """
-
-from flask import Flask, jsonify, send_from_directory
+import os, sys, time, threading
+from flask import Flask, jsonify, send_file
 from flask_socketio import SocketIO
-import threading
-import time
-import os
-import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 from monitor import WiFiMonitor
 
-app = Flask(__name__, static_folder="static")
-app.config["SECRET_KEY"] = "wifimonitor_secret"
+app = Flask(__name__)
+app.config["SECRET_KEY"] = "wifithreatmonitor2024"
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 monitor = WiFiMonitor()
 
-@app.route("/")
-def index():
-    return send_from_directory(".", "index.html")
-
+# ── REST API ──────────────────────────────────────────────────────────────────
 @app.route("/api/snapshot")
 def snapshot():
     return jsonify(monitor.get_snapshot())
 
-
 @app.route("/api/devices")
 def devices():
-    snap = monitor.get_snapshot()
-    return jsonify(snap["devices"])
-
+    return jsonify(monitor.get_snapshot()["devices"])
 
 @app.route("/api/events")
 def events():
-    snap = monitor.get_snapshot()
-    return jsonify(snap["events"])
-
+    return jsonify(monitor.get_snapshot()["events"])
 
 @app.route("/api/stats")
 def stats():
-    snap = monitor.get_snapshot()
-    return jsonify(snap["stats"])
-
-
-@app.route("/api/device/<mac>")
-def device_detail(mac):
-    snap = monitor.get_snapshot()
-    for dev in snap["devices"]:
-        if dev["mac"].replace(":", "").lower() == mac.replace(":", "").lower():
-            return jsonify(dev)
-    return jsonify({"error": "Device not found"}), 404
-
+    return jsonify(monitor.get_snapshot()["stats"])
 
 @app.route("/api/scan", methods=["POST"])
 def trigger_scan():
-    monitor.scan_network()
-    return jsonify({"status": "ok", "message": "Scan triggered"})
+    threading.Thread(target=monitor.scan_network, daemon=True).start()
+    return jsonify({"status": "ok", "message": "Scan started"})
 
+@app.route("/")
+def dashboard():
+    # Serve the dashboard HTML file
+    html_path = os.path.join(os.path.dirname(__file__), "wifi_monitor_dashboard.html")
+    if os.path.exists(html_path):
+        return send_file(html_path)
+    return "<h1>Dashboard not found — place wifi_monitor_dashboard.html in same folder</h1>"
 
+# ── WebSocket ─────────────────────────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
-    print(f"Client connected")
     socketio.emit("snapshot", monitor.get_snapshot())
 
-
-def push_updates():
+def push_loop():
+    """Push live updates every 30 seconds."""
     while True:
-        time.sleep(8)
+        time.sleep(30)
         monitor.scan_network()
         socketio.emit("snapshot", monitor.get_snapshot())
 
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("WiFi Threat Monitor starting...")
+    if os.name != "nt" and os.geteuid() != 0:
+        print("[ERROR] Run as root: sudo python server.py")
+        sys.exit(1)
+
+    print("=" * 55)
+    print("  WiFi Threat Monitor — Starting up")
+    print("=" * 55)
+
+    # Initial scan
+    print("[*] Running first scan...")
     monitor.scan_network()
 
-    update_thread = threading.Thread(target=push_updates, daemon=True)
-    update_thread.start()
+    # Background scan thread
+    pusher = threading.Thread(target=push_loop, daemon=True)
+    pusher.start()
 
-    print("Dashboard: http://localhost:5050")
-    socketio.run(app, host="0.0.0.0", port=5050, debug=False, allow_unsafe_werkzeug=True)
+    print(f"\n[✓] Dashboard: http://localhost:5050")
+    print(f"[✓] API:       http://localhost:5050/api/snapshot")
+    print(f"[*] Scanning every 30 seconds...\n")
+
+    socketio.run(app, host="0.0.0.0", port=5050, debug=False)
