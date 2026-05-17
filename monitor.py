@@ -1,466 +1,458 @@
 """
-WiFi Threat Monitor with AI Anomaly Detection
-Core monitoring engine - scans network, detects threats, flags anomalies
+WiFi Threat Monitor — REAL Network Scanner
+==========================================
+Scans YOUR actual WiFi network using:
+  - Scapy ARP sweep (discovers live devices + MACs)
+  - nmap port scan (finds open services)
+  - AI anomaly detection (flags unusual behaviour)
+  - Rule engine (ARP spoof, port scan, MAC spoof, dangerous ports)
+
+Run with:  sudo python monitor.py
+Requires:  pip install scapy flask flask-socketio
+           sudo apt install nmap   (Linux)
+           brew install nmap       (Mac)
 """
 
-import time
-import socket
-import struct
-import random
-import hashlib
-import json
-import threading
+import os, sys, time, socket, hashlib, threading, subprocess, platform
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, asdict
 from typing import Optional
-import subprocess
-import platform
 
-# ─── Data Models ─────────────────────────────────────────────────────────────
+# ── Dependency check ──────────────────────────────────────────────────────────
+def check_deps():
+    missing = []
+    try: import scapy.all
+    except ImportError: missing.append("scapy")
+    try: import flask
+    except ImportError: missing.append("flask")
+    try: import flask_socketio
+    except ImportError: missing.append("flask-socketio")
+    if missing:
+        print(f"[ERROR] Missing: {', '.join(missing)}")
+        print(f"Fix:    pip install {' '.join(missing)}")
+        sys.exit(1)
 
-@dataclass
-class Device:
-    mac: str
-    ip: str
-    hostname: str
-    vendor: str
-    first_seen: str
-    last_seen: str
-    packets_sent: int = 0
-    packets_recv: int = 0
-    bytes_sent: int = 0
-    bytes_recv: int = 0
-    open_ports: list = field(default_factory=list)
-    threat_score: float = 0.0
-    flags: list = field(default_factory=list)
-    is_gateway: bool = False
-    is_new: bool = True
-    anomaly_score: float = 0.0
+check_deps()
+from scapy.all import ARP, Ether, srp, conf as scapy_conf
+scapy_conf.verb = 0
 
-
-@dataclass
-class ThreatEvent:
-    event_id: str
-    timestamp: str
-    threat_type: str
-    severity: str          # low / medium / high / critical
-    source_mac: str
-    source_ip: str
-    description: str
-    recommendation: str
-    raw_data: dict = field(default_factory=dict)
-
-
-@dataclass
-class NetworkStats:
-    total_devices: int = 0
-    new_devices: int = 0
-    threats_detected: int = 0
-    packets_per_second: float = 0.0
-    bytes_per_second: float = 0.0
-    anomalies: int = 0
-    scan_time: str = ""
-    gateway_ip: str = ""
-    ssid: str = "Unknown"
-    security: str = "Unknown"
-
-
-# ─── Vendor OUI Database (partial, for demo) ─────────────────────────────────
-
+# ── Vendor OUI lookup ─────────────────────────────────────────────────────────
 OUI_DB = {
-    "00:50:56": "VMware",
-    "00:0C:29": "VMware",
+    "00:50:56": "VMware",       "00:0C:29": "VMware",
+    "B8:27:EB": "Raspberry Pi", "DC:A6:32": "Raspberry Pi",
+    "E4:5F:01": "Raspberry Pi",
+    "00:17:F2": "Apple",        "A4:C3:F0": "Apple",
+    "3C:22:FB": "Apple",        "F4:D4:88": "Apple",
+    "F8:FF:C2": "Apple",        "00:88:65": "Apple",
+    "FC:FB:FB": "Cisco",        "00:1E:13": "Cisco",
+    "00:23:F8": "Huawei",       "54:89:98": "Huawei",
+    "00:15:5D": "Microsoft",    "00:50:F2": "Microsoft",
+    "00:26:B9": "Dell",         "18:DB:F2": "Dell",
+    "00:25:90": "Samsung",      "CC:07:AB": "Samsung",
+    "84:2B:2B": "Samsung",
+    "10:02:B5": "Xiaomi",       "28:6C:07": "Xiaomi",
+    "8C:BE:BE": "TP-Link",      "EC:08:6B": "TP-Link",
+    "50:C7:BF": "TP-Link",
+    "00:09:5B": "Netgear",      "20:4E:7F": "Netgear",
     "00:1A:11": "Google",
-    "B8:27:EB": "Raspberry Pi",
-    "DC:A6:32": "Raspberry Pi",
-    "00:17:F2": "Apple",
-    "A4:C3:F0": "Apple",
-    "3C:22:FB": "Apple",
-    "00:1B:44": "SanDisk",
-    "FC:FB:FB": "Cisco",
-    "00:1E:13": "Cisco",
-    "00:23:F8": "Huawei",
-    "54:89:98": "Huawei",
-    "00:15:5D": "Microsoft (Hyper-V)",
-    "08:00:27": "VirtualBox",
-    "52:54:00": "QEMU/KVM",
-    "00:26:B9": "Dell",
-    "18:DB:F2": "Dell",
-    "00:90:96": "Unknown/Spoofed",
-    "DE:AD:BE": "Suspicious",
+    "08:00:27": "VirtualBox",   "52:54:00": "QEMU/KVM",
 }
 
-
 def lookup_vendor(mac: str) -> str:
-    prefix = mac[:8].upper()
-    for oui, vendor in OUI_DB.items():
-        if prefix.startswith(oui.replace(":", "").upper()[:6]):
+    oui = mac.upper()[:8]
+    for prefix, vendor in OUI_DB.items():
+        if oui.startswith(prefix.upper()):
             return vendor
     return "Unknown"
 
+# ── Data Models ───────────────────────────────────────────────────────────────
+@dataclass
+class Device:
+    mac: str; ip: str; hostname: str; vendor: str
+    first_seen: str; last_seen: str
+    packets_sent: int = 0; packets_recv: int = 0
+    bytes_sent: int = 0;   bytes_recv: int = 0
+    open_ports: list = field(default_factory=list)
+    threat_score: float = 0.0
+    flags: list = field(default_factory=list)
+    is_gateway: bool = False; is_new: bool = True
+    anomaly_score: float = 0.0
 
-# ─── AI Anomaly Detector ─────────────────────────────────────────────────────
+@dataclass
+class ThreatEvent:
+    event_id: str; timestamp: str; threat_type: str; severity: str
+    source_mac: str; source_ip: str; description: str; recommendation: str
+    raw_data: dict = field(default_factory=dict)
 
+@dataclass
+class NetworkStats:
+    total_devices: int = 0; new_devices: int = 0
+    threats_detected: int = 0; anomalies: int = 0
+    packets_per_second: float = 0.0; bytes_per_second: float = 0.0
+    scan_time: str = ""; gateway_ip: str = ""
+    ssid: str = "Unknown"; security: str = "Unknown"
+    local_ip: str = ""; subnet: str = ""
+
+# ── Network Utilities ─────────────────────────────────────────────────────────
+def get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]; s.close()
+        return ip
+    except: return "127.0.0.1"
+
+def get_gateway() -> str:
+    try:
+        system = platform.system()
+        if system == "Linux":
+            with open("/proc/net/route") as f:
+                for line in f.readlines()[1:]:
+                    parts = line.strip().split()
+                    if parts[1] == "00000000":
+                        h = parts[2]
+                        return ".".join(str(int(h[i:i+2], 16)) for i in [6,4,2,0])
+        elif system == "Darwin":
+            r = subprocess.run(["netstat","-rn"], capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if line.startswith("default"):
+                    return line.split()[1]
+        elif system == "Windows":
+            r = subprocess.run(["ipconfig"], capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if "Default Gateway" in line:
+                    gw = line.split(":")[-1].strip()
+                    if gw: return gw
+    except: pass
+    local = get_local_ip()
+    return ".".join(local.split(".")[:3]) + ".1"
+
+def get_wifi_info() -> dict:
+    info = {"ssid": "Unknown", "security": "Unknown"}
+    try:
+        system = platform.system()
+        if system == "Linux":
+            r = subprocess.run(["iwgetid","-r"], capture_output=True, text=True, timeout=3)
+            if r.returncode == 0: info["ssid"] = r.stdout.strip() or "Unknown"
+            r2 = subprocess.run(["nmcli","-t","-f","ACTIVE,SSID,SECURITY","dev","wifi"],
+                                 capture_output=True, text=True, timeout=3)
+            for line in r2.stdout.splitlines():
+                if line.startswith("yes:"):
+                    parts = line.split(":")
+                    if len(parts) >= 3:
+                        info["ssid"] = parts[1] or info["ssid"]
+                        info["security"] = parts[2] or "Unknown"
+        elif system == "Darwin":
+            r = subprocess.run(["/System/Library/PrivateFrameworks/Apple80211.framework"
+                                "/Versions/Current/Resources/airport","-I"],
+                               capture_output=True, text=True, timeout=3)
+            for line in r.stdout.splitlines():
+                l = line.strip()
+                if l.startswith("SSID:"): info["ssid"] = l.split(":",1)[-1].strip()
+                elif l.startswith("link auth:"): info["security"] = l.split(":",1)[-1].strip()
+        elif system == "Windows":
+            r = subprocess.run(["netsh","wlan","show","interfaces"],
+                               capture_output=True, text=True, timeout=3)
+            for line in r.stdout.splitlines():
+                l = line.strip()
+                if "SSID" in l and "BSSID" not in l:
+                    info["ssid"] = l.split(":")[-1].strip()
+                elif "Authentication" in l:
+                    info["security"] = l.split(":")[-1].strip()
+    except: pass
+    return info
+
+def resolve_hostname(ip: str) -> str:
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except: return ip
+
+def is_mac_spoofed(mac: str) -> bool:
+    try: return bool(int(mac.split(":")[0], 16) & 0x02)
+    except: return False
+
+# ── ARP Scanner (REAL) ────────────────────────────────────────────────────────
+def arp_scan(subnet: str, timeout: int = 3) -> list[dict]:
+    """Real ARP scan — finds all live hosts on your network."""
+    print(f"[SCAN] ARP sweeping {subnet} ...")
+    try:
+        packet = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=subnet)
+        answered, _ = srp(packet, timeout=timeout, verbose=False)
+        results = [{"ip": r.psrc, "mac": r.hwsrc.upper()} for _, r in answered]
+        print(f"[SCAN] {len(results)} live hosts found")
+        return results
+    except PermissionError:
+        print("[ERROR] ARP scan needs root. Run: sudo python monitor.py")
+        return []
+    except Exception as e:
+        print(f"[ERROR] ARP scan failed: {e}")
+        return []
+
+# ── Port Scanner ──────────────────────────────────────────────────────────────
+COMMON_PORTS = "21,22,23,25,53,80,110,135,139,143,443,445,554,3389,5900,8080,8443"
+DANGEROUS_PORTS = {
+    4444: "Metasploit shell", 1337: "Common backdoor", 31337: "Elite/backdoor",
+    12345: "NetBus trojan", 54321: "Reverse shell",
+    6667: "IRC botnet C2", 23: "Telnet (unencrypted)", 21: "FTP (unencrypted)",
+}
+
+def quick_port_scan(ip: str, ports: str = COMMON_PORTS) -> list[int]:
+    """nmap fast port scan, falls back to socket if nmap missing."""
+    open_ports = []
+    try:
+        r = subprocess.run(
+            ["nmap", "-T4", "--open", "-p", ports, ip, "--host-timeout", "5s"],
+            capture_output=True, text=True, timeout=12
+        )
+        for line in r.stdout.splitlines():
+            if "/tcp" in line and "open" in line:
+                open_ports.append(int(line.split("/")[0].strip()))
+    except FileNotFoundError:
+        # Fallback: raw socket scan
+        for p in map(int, ports.split(",")):
+            try:
+                s = socket.socket(); s.settimeout(0.4)
+                if s.connect_ex((ip, p)) == 0: open_ports.append(p)
+                s.close()
+            except: pass
+    except Exception as e:
+        print(f"[WARN] Port scan {ip}: {e}")
+    return open_ports
+
+# ── AI Anomaly Detector ───────────────────────────────────────────────────────
 class AnomalyDetector:
-    """
-    Simple statistical anomaly detector using rolling z-score + rule engine.
-    In a real deployment you'd use Isolation Forest or LSTM here.
-    """
-
-    def __init__(self, window=50):
+    def __init__(self, window=30):
         self.window = window
         self.history: dict[str, deque] = defaultdict(lambda: deque(maxlen=window))
-        self.baselines: dict[str, dict] = {}
 
-    def update(self, mac: str, feature_vec: dict) -> float:
-        """Feed new observation, return anomaly score 0-1."""
-        combined = (
-            feature_vec.get("pps", 0) * 0.4 +
-            feature_vec.get("bps", 0) / 10000 * 0.3 +
-            feature_vec.get("port_scan_score", 0) * 0.3
-        )
-        self.history[mac].append(combined)
-
-        if len(self.history[mac]) < 10:
-            return 0.0
-
+    def update(self, mac: str, pps: float, bps: float, port_count: int) -> float:
+        score = pps * 0.4 + (bps / 100000) * 0.3 + (port_count / 20.0) * 0.3
+        self.history[mac].append(score)
+        if len(self.history[mac]) < 5: return 0.0
         vals = list(self.history[mac])
         mean = sum(vals) / len(vals)
-        variance = sum((v - mean) ** 2 for v in vals) / len(vals)
-        std = variance ** 0.5
+        std = (sum((v-mean)**2 for v in vals) / len(vals)) ** 0.5
+        if std < 1e-9: return 0.0
+        z = abs(score - mean) / std
+        return min(1.0, z / 5.0)
 
-        if std < 1e-9:
-            return 0.0
-
-        z = abs(combined - mean) / std
-        # sigmoid-like normalisation: z=2 → 0.5, z=4 → 0.88
-        score = 1 - 1 / (1 + (z / 2) ** 2)
-        return min(score, 1.0)
-
-    def learn_baseline(self, mac: str):
-        if len(self.history[mac]) >= 10:
-            vals = list(self.history[mac])
-            self.baselines[mac] = {
-                "mean": sum(vals) / len(vals),
-                "std": (sum((v - sum(vals)/len(vals))**2 for v in vals) / len(vals)) ** 0.5
-            }
-
-
-# ─── Threat Rule Engine ───────────────────────────────────────────────────────
-
+# ── Threat Rules ──────────────────────────────────────────────────────────────
 class ThreatRuleEngine:
 
-    def check_arp_spoofing(self, devices: dict, arp_table: dict) -> list[ThreatEvent]:
-        events = []
-        seen_ips = defaultdict(list)
-        for mac, dev in devices.items():
-            seen_ips[dev.ip].append(mac)
+    def check_mac_spoof(self, dev: Device) -> Optional[ThreatEvent]:
+        if is_mac_spoofed(dev.mac):
+            return ThreatEvent(
+                event_id=hashlib.md5(f"macspoof_{dev.mac}".encode()).hexdigest()[:8],
+                timestamp=datetime.now().isoformat(),
+                threat_type="MAC Randomization / Spoofing",  severity="medium",
+                source_mac=dev.mac, source_ip=dev.ip,
+                description=f"{dev.ip} uses locally-administered MAC ({dev.mac}) — may be spoofed/randomized.",
+                recommendation="Verify device. Enable 802.1X for certificate-based auth.",
+            )
 
-        for ip, macs in seen_ips.items():
-            if len(macs) > 1:
+    def check_many_ports(self, dev: Device, threshold=10) -> Optional[ThreatEvent]:
+        if len(dev.open_ports) >= threshold:
+            return ThreatEvent(
+                event_id=hashlib.md5(f"manyports_{dev.mac}".encode()).hexdigest()[:8],
+                timestamp=datetime.now().isoformat(),
+                threat_type="Excessive Open Ports",  severity="high",
+                source_mac=dev.mac, source_ip=dev.ip,
+                description=f"{dev.hostname} ({dev.ip}) has {len(dev.open_ports)} open ports — unusual.",
+                recommendation="Review services. Disable unused ports. Isolate if unexpected.",
+                raw_data={"ports": dev.open_ports},
+            )
+
+    def check_dangerous_ports(self, dev: Device) -> list[ThreatEvent]:
+        events = []
+        for port in dev.open_ports:
+            if port in DANGEROUS_PORTS:
                 events.append(ThreatEvent(
-                    event_id=hashlib.md5(f"arp_{ip}_{time.time()}".encode()).hexdigest()[:8],
+                    event_id=hashlib.md5(f"dport_{dev.mac}_{port}".encode()).hexdigest()[:8],
                     timestamp=datetime.now().isoformat(),
-                    threat_type="ARP Spoofing",
-                    severity="critical",
-                    source_mac=macs[0],
-                    source_ip=ip,
-                    description=f"Multiple MACs ({', '.join(macs)}) claiming IP {ip}. Possible MITM attack.",
-                    recommendation="Isolate device, check for rogue APs. Enable Dynamic ARP Inspection on managed switches.",
-                    raw_data={"conflicting_macs": macs}
+                    threat_type="Dangerous Port Open",  severity="critical",
+                    source_mac=dev.mac, source_ip=dev.ip,
+                    description=f"Port {port} open on {dev.ip}: {DANGEROUS_PORTS[port]}.",
+                    recommendation=f"Investigate port {port} immediately. Block at firewall if unauthorized.",
+                    raw_data={"port": port},
                 ))
         return events
 
-    def check_port_scan(self, device: Device, scan_threshold=15) -> Optional[ThreatEvent]:
-        if len(device.open_ports) > scan_threshold:
+    def check_new_unknown(self, dev: Device) -> Optional[ThreatEvent]:
+        if dev.is_new and dev.vendor == "Unknown" and not dev.is_gateway:
             return ThreatEvent(
-                event_id=hashlib.md5(f"portscan_{device.mac}_{time.time()}".encode()).hexdigest()[:8],
+                event_id=hashlib.md5(f"newunk_{dev.mac}".encode()).hexdigest()[:8],
                 timestamp=datetime.now().isoformat(),
-                threat_type="Port Scan Detected",
-                severity="high",
-                source_mac=device.mac,
-                source_ip=device.ip,
-                description=f"Device has {len(device.open_ports)} open ports — possible reconnaissance.",
-                recommendation="Review open services. Block device if unexpected.",
-                raw_data={"open_ports": device.open_ports}
+                threat_type="Unknown New Device",  severity="medium",
+                source_mac=dev.mac, source_ip=dev.ip,
+                description=f"Unrecognized device joined network: {dev.ip} ({dev.mac}).",
+                recommendation="Identify this device. Block at router if unrecognized.",
             )
-        return None
 
-    def check_high_traffic(self, device: Device, bps_threshold=5_000_000) -> Optional[ThreatEvent]:
-        if device.bytes_sent > bps_threshold:
-            return ThreatEvent(
-                event_id=hashlib.md5(f"traffic_{device.mac}_{time.time()}".encode()).hexdigest()[:8],
-                timestamp=datetime.now().isoformat(),
-                threat_type="Abnormal Traffic Volume",
-                severity="medium",
-                source_mac=device.mac,
-                source_ip=device.ip,
-                description=f"Device sending {device.bytes_sent/1_000_000:.1f} MB — may indicate data exfiltration.",
-                recommendation="Monitor outbound connections. Check for malware or data leak.",
-                raw_data={"bytes_sent": device.bytes_sent}
-            )
-        return None
+    def check_arp_spoof(self, ip_to_macs: dict) -> list[ThreatEvent]:
+        events = []
+        for ip, macs in ip_to_macs.items():
+            if len(macs) > 1:
+                events.append(ThreatEvent(
+                    event_id=hashlib.md5(f"arp_{ip}".encode()).hexdigest()[:8],
+                    timestamp=datetime.now().isoformat(),
+                    threat_type="ARP Spoofing / MITM Attack",  severity="critical",
+                    source_mac=macs[0], source_ip=ip,
+                    description=f"MITM detected: {len(macs)} MACs claiming IP {ip}: {', '.join(macs)}",
+                    recommendation="Isolate suspicious device IMMEDIATELY. Enable Dynamic ARP Inspection.",
+                    raw_data={"conflicting_macs": macs},
+                ))
+        return events
 
-    def check_suspicious_mac(self, device: Device) -> Optional[ThreatEvent]:
-        mac_parts = device.mac.split(":")
-        if len(mac_parts) != 6:
-            return None
-        # Check locally-administered bit (bit 1 of first octet = MAC randomization/spoofing)
-        first_octet = int(mac_parts[0], 16)
-        if first_octet & 0x02:
-            return ThreatEvent(
-                event_id=hashlib.md5(f"macspoof_{device.mac}".encode()).hexdigest()[:8],
-                timestamp=datetime.now().isoformat(),
-                threat_type="MAC Randomization / Spoofing",
-                severity="low",
-                source_mac=device.mac,
-                source_ip=device.ip,
-                description=f"Device {device.mac} uses locally-administered MAC — could be spoofed or randomized.",
-                recommendation="Verify device identity through other means (hostname, behaviour).",
-                raw_data={}
-            )
-        return None
-
-
-# ─── Network Scanner ──────────────────────────────────────────────────────────
-
+# ── Main Monitor ──────────────────────────────────────────────────────────────
 class WiFiMonitor:
 
     def __init__(self):
         self.devices: dict[str, Device] = {}
         self.threat_events: list[ThreatEvent] = []
         self.stats = NetworkStats()
-        self.anomaly_detector = AnomalyDetector()
-        self.rule_engine = ThreatRuleEngine()
-        self.arp_table: dict[str, str] = {}
-        self._running = False
+        self.anomaly = AnomalyDetector()
+        self.rules = ThreatRuleEngine()
         self._lock = threading.Lock()
-        self._known_macs: set[str] = set()
+        self._scan_count = 0
 
-    def get_gateway(self) -> str:
-        try:
-            result = subprocess.run(
-                ["ip", "route", "show", "default"],
-                capture_output=True, text=True, timeout=3
-            )
-            parts = result.stdout.strip().split()
-            idx = parts.index("via") + 1 if "via" in parts else -1
-            return parts[idx] if idx > 0 else "192.168.1.1"
-        except Exception:
-            return "192.168.1.1"
+        # Detect real network info
+        self.local_ip = get_local_ip()
+        self.gateway  = get_gateway()
+        self.subnet   = ".".join(self.local_ip.split(".")[:3]) + ".0/24"
+        self.wifi_info = get_wifi_info()
 
-    def get_local_ip(self) -> str:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
-
-    def resolve_hostname(self, ip: str) -> str:
-        try:
-            return socket.gethostbyaddr(ip)[0]
-        except Exception:
-            return ip
-
-    def _generate_demo_mac(self, seed: str) -> str:
-        h = hashlib.md5(seed.encode()).hexdigest()
-        return ":".join(h[i:i+2] for i in range(0, 12, 2))
-
-    def _simulate_scan(self) -> list[dict]:
-        """
-        Simulates network scan results for demo.
-        In production: use scapy ARP scan or nmap.
-        """
-        gateway = self.get_gateway()
-        base = ".".join(gateway.split(".")[:3])
-
-        demo_devices = [
-            {"ip": gateway,          "mac": "FC:FB:FB:12:34:56", "hostname": "router.local"},
-            {"ip": f"{base}.101",    "mac": "A4:C3:F0:AA:BB:CC", "hostname": "macbook-pro.local"},
-            {"ip": f"{base}.102",    "mac": "B8:27:EB:DE:AD:01", "hostname": "raspberrypi.local"},
-            {"ip": f"{base}.103",    "mac": "00:23:F8:AB:12:34", "hostname": "android-phone"},
-            {"ip": f"{base}.104",    "mac": "DE:AD:BE:EF:CA:FE", "hostname": "unknown-device"},  # suspicious MAC
-            {"ip": f"{base}.105",    "mac": "54:89:98:77:66:55", "hostname": "huawei-tablet"},
-            {"ip": f"{base}.106",    "mac": "00:15:5D:11:22:33", "hostname": "windows-pc"},
-        ]
-        return demo_devices
+        print(f"[INFO] Local IP : {self.local_ip}")
+        print(f"[INFO] Gateway  : {self.gateway}")
+        print(f"[INFO] Subnet   : {self.subnet}")
+        print(f"[INFO] WiFi     : {self.wifi_info['ssid']} ({self.wifi_info['security']})")
 
     def scan_network(self):
-        """Perform one full network scan cycle."""
-        raw = self._simulate_scan()
-        gateway = self.get_gateway()
+        self._scan_count += 1
         now = datetime.now().isoformat()
         new_count = 0
 
+        # ── 1. Real ARP scan ──────────────────────────────────────────────────
+        raw_hosts = arp_scan(self.subnet)
+        if not raw_hosts:
+            self.stats.scan_time = now
+            return
+
         with self._lock:
-            seen_macs = set()
-
-            for entry in raw:
-                mac = entry["mac"]
-                ip = entry["ip"]
-                seen_macs.add(mac)
-
+            # ── 2. Process hosts ──────────────────────────────────────────────
+            for host in raw_hosts:
+                ip, mac = host["ip"], host["mac"]
                 is_new = mac not in self.devices
 
                 if is_new:
                     new_count += 1
                     dev = Device(
-                        mac=mac,
-                        ip=ip,
-                        hostname=entry.get("hostname", ip),
+                        mac=mac, ip=ip,
+                        hostname=resolve_hostname(ip),
                         vendor=lookup_vendor(mac),
-                        first_seen=now,
-                        last_seen=now,
-                        is_gateway=(ip == gateway),
-                        is_new=True
+                        first_seen=now, last_seen=now,
+                        is_gateway=(ip == self.gateway),
+                        is_new=True,
                     )
+                    dev.open_ports = quick_port_scan(ip)
                 else:
                     dev = self.devices[mac]
                     dev.ip = ip
                     dev.last_seen = now
                     dev.is_new = False
+                    if self._scan_count % 5 == 0:
+                        dev.open_ports = quick_port_scan(ip)
 
-                # Simulate traffic counters
-                dev.packets_sent += random.randint(0, 200)
-                dev.packets_recv += random.randint(0, 150)
-                dev.bytes_sent += random.randint(0, 50_000)
-                dev.bytes_recv += random.randint(0, 80_000)
+                # ── 3. AI anomaly ─────────────────────────────────────────────
+                dev.anomaly_score = self.anomaly.update(
+                    mac,
+                    dev.packets_sent / max(1, self._scan_count),
+                    dev.bytes_sent   / max(1, self._scan_count),
+                    len(dev.open_ports),
+                )
 
-                # Simulate open ports for demo
-                if dev.is_gateway:
-                    dev.open_ports = [80, 443, 22, 53, 8080]
-                elif "raspberrypi" in dev.hostname:
-                    dev.open_ports = [22, 8080, 5000, 80, 443, 3306, 5432, 6379, 27017, 9000,
-                                      9001, 9002, 9003, 9004, 9005, 9006, 9007]  # many ports → threat
-                else:
-                    dev.open_ports = random.sample(range(80, 9000), random.randint(1, 4))
+                # ── 4. Rule engine ────────────────────────────────────────────
+                score, flags = 0.0, []
+                if dev.is_gateway: flags.append("gateway")
 
-                # AI anomaly scoring
-                feature_vec = {
-                    "pps": dev.packets_sent / max(1, (time.time() % 60)),
-                    "bps": dev.bytes_sent,
-                    "port_scan_score": len(dev.open_ports) / 20.0
-                }
-                dev.anomaly_score = self.anomaly_detector.update(mac, feature_vec)
+                for evt, inc, flag in [
+                    (self.rules.check_mac_spoof(dev),     20, "MAC Spoofed"),
+                    (self.rules.check_many_ports(dev),    30, "Too Many Ports"),
+                    (self.rules.check_new_unknown(dev),   15, "Unknown Device"),
+                ]:
+                    if evt:
+                        score += inc; flags.append(flag)
+                        self._add_event(evt)
 
-                # Rule-based threat scoring
-                score = dev.anomaly_score * 40
-                flags = []
+                for dp_evt in self.rules.check_dangerous_ports(dev):
+                    score += 40
+                    flags.append(f"Port {dp_evt.raw_data.get('port','?')}")
+                    self._add_event(dp_evt)
 
-                suspicious_event = self.rule_engine.check_suspicious_mac(dev)
-                if suspicious_event:
-                    score += 20
-                    flags.append("Suspicious MAC")
-                    self._add_event(suspicious_event)
-
-                port_event = self.rule_engine.check_port_scan(dev)
-                if port_event:
-                    score += 35
-                    flags.append("Port Scan")
-                    self._add_event(port_event)
-
-                traffic_event = self.rule_engine.check_high_traffic(dev)
-                if traffic_event:
-                    score += 25
-                    flags.append("High Traffic")
-                    self._add_event(traffic_event)
-
-                dev.threat_score = min(score, 100)
-                dev.flags = flags
+                score += dev.anomaly_score * 30
+                dev.threat_score = min(round(score), 100)
+                dev.flags = list(set(flags))
                 self.devices[mac] = dev
 
-            # ARP spoofing check (simulated conflict for demo)
-            if len(self.devices) > 3:
-                first_two = list(self.devices.values())[:2]
-                fake_conflict = {first_two[0].ip: [first_two[0].mac, first_two[1].mac]}
-                for ip, macs in fake_conflict.items():
-                    if len(macs) > 1 and random.random() < 0.02:  # 2% chance per scan
-                        self._add_event(ThreatEvent(
-                            event_id=hashlib.md5(f"arp_{ip}_{time.time()}".encode()).hexdigest()[:8],
-                            timestamp=now,
-                            threat_type="ARP Spoofing",
-                            severity="critical",
-                            source_mac=macs[1],
-                            source_ip=ip,
-                            description=f"ARP conflict on {ip} — two MACs responding.",
-                            recommendation="Enable Dynamic ARP Inspection. Isolate suspicious device immediately.",
-                            raw_data={}
-                        ))
+            # ── 5. ARP spoof check ────────────────────────────────────────────
+            ip_map = defaultdict(list)
+            for m, d in self.devices.items(): ip_map[d.ip].append(m)
+            for evt in self.rules.check_arp_spoof(ip_map):
+                self._add_event(evt)
 
-            # Update global stats
-            self.stats.total_devices = len(self.devices)
-            self.stats.new_devices = new_count
-            self.stats.threats_detected = len([
-                d for d in self.devices.values() if d.threat_score > 30
-            ])
-            self.stats.anomalies = len([
-                d for d in self.devices.values() if d.anomaly_score > 0.5
-            ])
-            self.stats.packets_per_second = round(
-                sum(d.packets_sent for d in self.devices.values()) / 60, 1
-            )
-            self.stats.bytes_per_second = round(
-                sum(d.bytes_sent for d in self.devices.values()) / 60, 0
-            )
-            self.stats.scan_time = now
-            self.stats.gateway_ip = gateway
-            self.stats.ssid = "HomeNetwork-5G"
-            self.stats.security = "WPA3"
+            # ── 6. Stats ──────────────────────────────────────────────────────
+            self.stats.total_devices    = len(self.devices)
+            self.stats.new_devices      = new_count
+            self.stats.threats_detected = sum(1 for d in self.devices.values() if d.threat_score > 30)
+            self.stats.anomalies        = sum(1 for d in self.devices.values() if d.anomaly_score > 0.5)
+            self.stats.scan_time        = now
+            self.stats.gateway_ip       = self.gateway
+            self.stats.local_ip         = self.local_ip
+            self.stats.subnet           = self.subnet
+            self.stats.ssid             = self.wifi_info["ssid"]
+            self.stats.security         = self.wifi_info["security"]
+
+        print(f"[DONE] #{self._scan_count}: {self.stats.total_devices} devices, "
+              f"{self.stats.threats_detected} threats")
 
     def _add_event(self, event: ThreatEvent):
-        """Add threat event (deduplicated by type+MAC within 60s)."""
-        cutoff = (datetime.now() - timedelta(seconds=60)).isoformat()
-        duplicate = any(
-            e.threat_type == event.threat_type and
-            e.source_mac == event.source_mac and
-            e.timestamp > cutoff
-            for e in self.threat_events
-        )
-        if not duplicate:
+        cutoff = (datetime.now() - timedelta(minutes=2)).isoformat()
+        dup = any(e.threat_type == event.threat_type and
+                  e.source_mac == event.source_mac and
+                  e.timestamp > cutoff
+                  for e in self.threat_events)
+        if not dup:
             self.threat_events.insert(0, event)
-            self.threat_events = self.threat_events[:100]  # cap at 100
+            self.threat_events = self.threat_events[:200]
 
     def get_snapshot(self) -> dict:
         with self._lock:
             return {
                 "devices": [asdict(d) for d in self.devices.values()],
-                "events": [asdict(e) for e in self.threat_events[:20]],
-                "stats": asdict(self.stats)
+                "events":  [asdict(e) for e in self.threat_events[:30]],
+                "stats":   asdict(self.stats),
             }
 
-    def start(self, interval=10):
-        self._running = True
+    def start_background(self, interval=30):
         def loop():
-            while self._running:
-                try:
-                    self.scan_network()
-                except Exception as e:
-                    print(f"Scan error: {e}")
+            while True:
+                try: self.scan_network()
+                except Exception as e: print(f"[ERROR] {e}")
                 time.sleep(interval)
         t = threading.Thread(target=loop, daemon=True)
         t.start()
         return t
 
-    def stop(self):
-        self._running = False
 
-
-# ─── Entry point for testing ──────────────────────────────────────────────────
-
+# ── CLI mode ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("Starting WiFi Monitor (demo mode)...")
-    monitor = WiFiMonitor()
-    monitor.scan_network()
-    snap = monitor.get_snapshot()
-    print(f"\n✅ Devices found: {snap['stats']['total_devices']}")
-    print(f"⚠️  Threats: {snap['stats']['threats_detected']}")
-    print(f"🤖 Anomalies: {snap['stats']['anomalies']}")
-    for d in snap["devices"]:
-        print(f"  {d['ip']:16s}  {d['mac']}  {d['vendor']:20s}  score={d['threat_score']:.0f}")
-    print("\n--- Events ---")
-    for e in snap["events"]:
-        print(f"  [{e['severity'].upper():8s}] {e['threat_type']} — {e['description'][:60]}")
+    if os.name != "nt" and os.geteuid() != 0:
+        print("[ERROR] Run as root: sudo python monitor.py")
+        sys.exit(1)
+    mon = WiFiMonitor()
+    mon.scan_network()
+    snap = mon.get_snapshot()
+    print(f"\nDevices: {snap['stats']['total_devices']} | Threats: {snap['stats']['threats_detected']}")
+    for d in sorted(snap["devices"], key=lambda x: x["threat_score"], reverse=True):
+        icon = "🚨" if d["threat_score"] > 60 else "⚠️ " if d["threat_score"] > 30 else "✅"
+        print(f"  {icon} {d['ip']:16s}  {d['mac']}  {d['vendor']:18s}  score={d['threat_score']}")
