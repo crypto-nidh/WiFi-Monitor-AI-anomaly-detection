@@ -1,3 +1,9 @@
-scapy>=2.5.0
-flask>=3.0.0
-flask-socketio>=5.3.6
+Flask
+flask-socketio
+scapy
+nmap
+requests
+sqlalchemy
+jinja2
+PyPDF2
+python-dotenv
