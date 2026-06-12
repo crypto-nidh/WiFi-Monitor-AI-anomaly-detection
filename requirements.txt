@@ -1,9 +1,8 @@
-Flask
-flask-socketio
-scapy
-nmap
-requests
-sqlalchemy
-jinja2
-PyPDF2
-python-dotenv
+flask>=3.0
+flask-socketio>=5.3
+scapy>=2.5
+requests>=2.31
+python-nmap>=0.7
+fpdf2>=2.7         # PDF report generation
+jinja2>=3.1
+python-dotenv>=1.0
